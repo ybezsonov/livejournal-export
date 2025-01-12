@@ -143,7 +143,7 @@ def ensure_rdf_for_user(username, rdf_dir):
 def download_rdf(username, download_dir):
     save_file = Path(download_dir, username + ".rdf")
 
-    r = requests.get(f'http://{username}{BASE_URL}')
+    r = requests.get(f'http://{username}{BASE_URL}', verify=False)
     if r.status_code == requests.codes.ok:
         with open(save_file, 'wb') as f:
             f.write(r.content)

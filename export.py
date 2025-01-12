@@ -19,10 +19,13 @@ import arrow
 import html2text
 import markdown
 import requests
-from jitter import jitter
+from jitter import delay
 
-import ljconfig as config
+import ljconfig_yb as config
 import userpics
+
+from bs4 import BeautifulSoup
+from urllib.parse import unquote
 
 # Other constants
 HEADERS = {
@@ -47,7 +50,8 @@ EXPORT_DIRS = [
     'posts_html',
     'posts_markdown',
     'comments_xml',
-    'userpics'
+    'userpics',
+    'images'
 ]
 
 TAG = re.compile(r'\[!\[(.*?)\]\(http:/\/utx.ambience.ru\/img\/.*?\)\]\(.*?\)')
@@ -85,9 +89,9 @@ def main():
         create_comments_json_all_file(export_dirs['comments_xml'], export_dirs['lj_user'])
 
     if True:
-        with open(os.path.join(export_dirs['lj_user'], 'all_posts.json'), 'r') as f:
+        with open(os.path.join(export_dirs['lj_user'], 'all_posts.json'), 'r', encoding='utf-8') as f:
             all_posts = json.load(f)
-        with open(os.path.join(export_dirs['lj_user'], 'all_comments.json'), 'r') as f:
+        with open(os.path.join(export_dirs['lj_user'], 'all_comments.json'), 'r', encoding='utf-8') as f:
             all_comments = json.load(f)
 
         combine(all_posts, all_comments, export_dirs)
@@ -119,13 +123,24 @@ def create_posts_json_all_file(posts_xml_dir, lj_user_dir):
 
     xml_files = find_files_by_pattern('*.xml', posts_xml_dir)
     for xml_file in xml_files:
-        with open(xml_file, 'rt') as f:
-            xml_posts.extend(list(xml_element_tree.fromstring(f.read()).iter('entry')))
+        try:
+            with open(xml_file, 'rt', encoding='utf-8') as f:
+                tree = xml_element_tree.fromstring(f.read())
+                entries = list(tree.iter('entry'))
+                xml_posts.extend(entries)
+        except UnicodeDecodeError:
+            print(f"Encoding error in file: {xml_file}")
+        except xml_element_tree.ParseError:
+            print(f"XML parsing error in file: {xml_file}")
+        except Exception as e:
+            print(f"Error processing {xml_file}: {str(e)}")
 
     json_posts = list(map(post_xml_to_json, xml_posts))
     posts_json_all_filename = os.path.join(lj_user_dir, 'all_posts.json')
-    with open(posts_json_all_filename, 'w') as f:
-        f.write(json.dumps(json_posts, ensure_ascii=False, indent=2))
+
+    # Write JSON with UTF-8 encoding
+    with open(posts_json_all_filename, 'w', encoding='utf-8') as f:
+        json.dump(json_posts, f, ensure_ascii=False, indent=2)
 
 
 def create_comments_json_all_file(comments_xml_dir, lj_user_dir):
@@ -138,12 +153,12 @@ def create_comments_json_all_file(comments_xml_dir, lj_user_dir):
 
     xml_files = find_files_by_pattern('comment_body*.xml', comments_xml_dir)
     for xml_file in xml_files:
-        with open(xml_file, 'rt') as f:
+        with open(xml_file, 'rt', encoding='utf-8') as f:
             new_comments = extract_comments_from_xml(f.read(), users)
             all_comments.extend(new_comments)
 
     comments_json_all_filename = os.path.join(lj_user_dir, "all_comments.json")
-    with open(comments_json_all_filename, 'w') as f:
+    with open(comments_json_all_filename, 'w', encoding='utf-8') as f:
         f.write(json.dumps(all_comments, ensure_ascii=False, indent=2))
 
     return
@@ -443,7 +458,7 @@ def make_md_comment(comment, export_dirs, level=0):
 
     # print(comment.get('author', 'anonymous')+"\n------------")
 
-    rv_md = markdown.markdown(md, ['markdown.extensions.extra'])
+    rv_md = markdown.markdown(md, extensions=['markdown.extensions.extra'])
     # print(rv_md)
 
     return rv_md
@@ -466,21 +481,97 @@ def save_as_json(json_post, post_comments, posts_json_dir):
     json_id = json_post['id']
     json_data = {'id': json_id, 'post': json_post, 'comments': post_comments}
     json_filename = os.path.join(posts_json_dir, '{0}.json'.format(json_id))
-    with open(json_filename, 'w') as json_file:
+    with open(json_filename, 'w', encoding='utf-8') as json_file:
         json_file.write(json.dumps(json_data, ensure_ascii=False, indent=2))
 
+def extract_image_urls(html_content):
+    """Extract image URLs from HTML content"""
+    image_urls = set()  # Using set to avoid duplicates
+
+    soup = BeautifulSoup(html_content, 'html.parser')
+
+    # Find all img tags
+    for img in soup.find_all('img'):
+        src = img.get('src')
+        if src:
+            src = unquote(src)
+            # Basic URL validation
+            if src.startswith(('http://', 'https://', '//')):
+                # Convert protocol-relative URLs
+                if src.startswith('//'):
+                    src = 'https:' + src
+                image_urls.add(src)
+
+    return list(image_urls)
 
 def save_as_markdown(json_post, subfolder, post_comments_md,
                      posts_markdown_dir):
     parent_md_dir = os.path.join(posts_markdown_dir, subfolder)
     os.makedirs(parent_md_dir, exist_ok=True)
 
-    md_filename = os.path.join(parent_md_dir, json_post['slug'] + ".md")
-    with open(md_filename, 'w') as md_file:
-        md_file.write(json_to_markdown(json_post))
+    # Extract images before converting HTML to markdown
+    original_body = json_post['body']
+    image_urls = extract_image_urls(original_body)
 
-        if post_comments_md:
-            md_file.write('\n' + post_comments_md)
+    EXCLUDED_PATTERNS = {
+        'mylongrun',
+        'yb-mylong-run-img.s3',
+        'yb-instagram.s3',
+        'images.yuriybezsonov.com',
+    }
+    def should_exclude_url(url):
+        return any(pattern in url.lower() for pattern in EXCLUDED_PATTERNS)
+
+    export_dirs = ensure_export_dirs(DOWNLOADED_JOURNALS_DIR, config.username, EXPORT_DIRS)
+    url_to_replace = ''
+
+    for image_url in image_urls:
+        # print(image_url)
+        if should_exclude_url(image_url):
+            with open(os.path.join(export_dirs['lj_user'], 'images-exluded.txt'), 'a') as f:
+                f.write(image_url + '\n')
+            url_to_replace = ''
+        else:
+            with open(os.path.join(export_dirs['lj_user'], 'images-to-download.txt'), 'a') as f:
+                f.write(image_url + '\n')
+            response = requests.get(image_url)
+            if response.status_code == 200:
+                # Save the image to a file
+                image_filename = os.path.join(export_dirs['images'], os.path.basename(image_url))
+                with open(image_filename, 'wb') as f:
+                    f.write(response.content)
+                    url_to_replace = image_url
+                # if url contains ic.pics.livejournal.com and don't end with original.jpg than replace the last word after last _ with original.jpg
+                if 'ic.pics.livejournal.com' in image_url and not image_url.endswith('original.jpg'):
+                    image_url = image_url.rsplit('_', 1)[0] + '_original.jpg'
+                    # save the image with the new name
+                    response = requests.get(image_url)
+                    if response.status_code == 200:
+                        image_filename = os.path.join(export_dirs['images'], os.path.basename(image_url))
+                        with open(image_filename, 'wb') as f:
+                            f.write(response.content)
+
+            # write image to post folder under /json_post['id']
+            if response.status_code == 200:
+                image_filename = os.path.join(parent_md_dir, json_post['id'], os.path.basename(image_url))
+                os.makedirs(os.path.dirname(image_filename), exist_ok=True)
+                with open(image_filename, 'wb') as f:
+                    f.write(response.content)
+
+                # Replace the image URL in the body with the local path
+                json_post['body'] = json_post['body'].replace(url_to_replace, json_post['id'] + '/' + os.path.basename(image_url))
+
+    # md_filename = os.path.join(parent_md_dir, json_post['slug'] + ".md")
+    md_filename = os.path.join(parent_md_dir, json_post['id'] + ".md")
+    with open(md_filename, 'w', encoding='utf-8') as md_file:
+        md = json_to_markdown(json_post)
+        # iterate ms and remove trailing spaces
+        for line in md.splitlines():
+            md_file.write(line.rstrip() + '\n')
+        # md_file.write(json_to_markdown(json_post))
+
+        # if post_comments_md:
+        #     md_file.write('\n' + post_comments_md)
 
 
 def save_as_html(json_post, subfolder, post_comments_html, posts_html_dir):
@@ -490,7 +581,7 @@ def save_as_html(json_post, subfolder, post_comments_html, posts_html_dir):
     os.makedirs(parent_dir, exist_ok=True)
 
     html_filename = os.path.join(parent_dir, post_id + ".html")
-    with open(html_filename, 'w') as html_file:
+    with open(html_filename, 'w', encoding='utf-8') as html_file:
         html_file.writelines(post_json_to_html(json_post))
         if post_comments_html:
             html_file.write('\n<h2>Comments</h2>\n' + post_comments_html)
@@ -508,6 +599,11 @@ def combine(posts, comments, export_dirs):
     posts_comments = group_comments_by_post(comments)
 
     num_posts = len(posts)
+
+    # delete files os.path.join(export_dirs['lj_user'], 'images-*.txt' if exists
+    for file in os.listdir(export_dirs['lj_user']):
+        if file.startswith('images-') and file.endswith('.txt'):
+            os.remove(os.path.join(export_dirs['lj_user'], file))
 
     start_time = datetime.now()
     for i, json_post in enumerate(posts):
@@ -613,13 +709,14 @@ def download_posts(posts_xml_dir):
     return
 
 # Comments
-@jitter()
+@delay()
 def fetch_xml(params):
     response = requests.get(
         'http://www.livejournal.com/export_comments.bml',
         params=params,
         headers=config.header,
-        cookies=get_cookies()
+        cookies=get_cookies(),
+        verify=False
     )
     return response.text
 
